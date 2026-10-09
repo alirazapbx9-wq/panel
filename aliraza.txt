@@ -1,0 +1,1432 @@
+cat << 'INSTALLER_EOF' > /tmp/install_panel.sh
+#!/bin/bash
+
+# ==============================================================================
+# Script Name   : ARTRICKS VPN & Web Manager Ultimate Auto-Installer
+# Target OS     : Ubuntu 20.04 / 22.04 / 24.04 (64-bit)
+# ==============================================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}[ERROR] Is script ko ROOT privilege ke sath chalaen! (sudo -i)${NC}"
+   exit 1
+fi
+
+clear
+echo -e "${CYAN}====================================================${NC}"
+echo -e "${GREEN}    ARTRICKS VPN & Web Manager Auto-Installer    ${NC}"
+echo -e "${CYAN}====================================================${NC}"
+echo -e "${YELLOW}[1/7] Packages & System Tools Install Ho Rahe Hain...${NC}\n"
+
+# 1. Update Packages & Dependencies
+apt update -y && apt upgrade -y
+apt install -y curl wget unzip tar net-tools socat jq openssl nginx dropbear certbot python3 python3-pip python3-flask lsof iptables
+
+# 2. Setup System Shells Fix for Dropbear Auth
+grep -qxF '/bin/false' /etc/shells || echo '/bin/false' >> /etc/shells
+grep -qxF '/usr/sbin/nologin' /etc/shells || echo '/usr/sbin/nologin' >> /etc/shells
+
+# 3. Create Required Directories
+mkdir -p /etc/raretriccks/users
+mkdir -p /usr/local/bin
+chmod 755 /etc/raretriccks/users
+
+# 4. Deploy Web Dashboard Script (raretriccks_web.py)
+echo -e "${BLUE}[2/7] Deploying Web Panel Dashboard...${NC}"
+cat << 'PYTHON_EOF' > /usr/local/bin/raretriccks_web.py
+import os, json, subprocess, datetime, glob, re
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+CONFIG_PATH = "/etc/raretriccks/panel_config.json"
+USER_DIR = "/etc/raretriccks/users"
+DOMAIN_FILE = "/etc/raretriccks/domain.conf"
+CUSTOM_PATH = "/raretriccks"
+DEFAULT_DOMAIN = "ind.alyan.tech"
+
+os.makedirs(USER_DIR, exist_ok=True)
+os.makedirs("/etc/raretriccks", exist_ok=True)
+
+def load_config():
+    default_cfg = {"admin_user": "admin", "admin_pass": "AdminPassword123!"}
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f: return json.load(f)
+        except Exception: pass
+    with open(CONFIG_PATH, "w") as f: json.dump(default_cfg, f)
+    return default_cfg
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w") as f: json.dump(cfg, f, indent=4)
+
+if not os.path.exists(DOMAIN_FILE) or os.path.getsize(DOMAIN_FILE) == 0:
+    with open(DOMAIN_FILE, "w") as f: f.write(DEFAULT_DOMAIN)
+
+def run_cmd(cmd):
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        return res.stdout.strip()
+    except Exception as e: return str(e)
+
+def get_domain():
+    if os.path.exists(DOMAIN_FILE):
+        try:
+            with open(DOMAIN_FILE, 'r') as f:
+                d = f.read().strip()
+                if d: return d
+        except Exception: pass
+    return DEFAULT_DOMAIN
+
+def apply_nginx_config(domain):
+    if not domain: domain = DEFAULT_DOMAIN
+    cert_path = f"/etc/letsencrypt/live/{domain}/fullchain.pem"
+    key_path = f"/etc/letsencrypt/live/{domain}/privkey.pem"
+    cert_exists = os.path.exists(cert_path) and os.path.exists(key_path)
+    
+    ssl_block = ""
+    if cert_exists:
+        ssl_block = f"""
+server {{
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name {domain} _;
+
+    ssl_certificate {cert_path};
+    ssl_certificate_key {key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    location / {{
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }}
+
+    location {CUSTOM_PATH} {{
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }}
+}}
+"""
+    nginx_conf = f"""server {{
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name {domain} _;
+
+    location / {{
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }}
+
+    location {CUSTOM_PATH} {{
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }}
+}}
+{ssl_block}
+"""
+    with open("/etc/nginx/conf.d/vpn.conf", "w") as f: f.write(nginx_conf)
+    run_cmd("rm -f /etc/nginx/sites-enabled/default")
+    run_cmd("systemctl restart nginx")
+
+def get_users_data():
+    users = {}
+    conf_files = glob.glob(f"{USER_DIR}/*.conf")
+    for conf in conf_files:
+        uname = os.path.basename(conf).replace('.conf', '')
+        ip_limit, gb_limit, used_mb = "1", "1", 0.0
+        try:
+            with open(conf, 'r') as f:
+                for line in f:
+                    if line.startswith("IP_LIMIT="): ip_limit = line.strip().split("=")[1]
+                    elif line.startswith("GB_LIMIT="): gb_limit = line.strip().split("=")[1]
+                    elif line.startswith("USED_MB="): used_mb = float(line.strip().split("=")[1])
+        except Exception: pass
+
+        chage_out = run_cmd(f"chage -l {uname}")
+        expiry = "N/A"
+        for line in chage_out.splitlines():
+            if "Account expires" in line:
+                expiry = line.split(":")[1].strip()
+                break
+
+        passwd_out = run_cmd(f"passwd -S {uname}")
+        status = "Active"
+        if " L " in f" {passwd_out} ": status = "LOCKED"
+
+        if used_mb < 1024:
+            used_str = f"{used_mb:.2f} MB"
+        else:
+            used_str = f"{(used_mb / 1024.0):.2f} GB"
+
+        users[uname] = {
+            "ip_limit": ip_limit,
+            "gb_limit": gb_limit,
+            "used_str": used_str,
+            "expiry": expiry,
+            "status": status
+        }
+    return users
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARTRICKS VPN Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>tailwind.config = { darkMode: 'class', theme: { extend: { colors: { brand: { 500: '#4ade80', 600: '#16a34a', 700: '#15803d' } } } } }</script>
+    <style>
+        @keyframes slideInLeft {
+            from { transform: translateX(-100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        .animate-toast { animation: slideInLeft 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        body { background-image: radial-gradient(ellipse at top, rgba(22,163,74,.12), transparent 55%); }
+        .panel-card { box-shadow: 0 10px 30px rgba(0,0,0,.18); transition: border-color .2s ease, transform .2s ease; }
+        .panel-card:hover { border-color: rgba(74,222,128,.35); }
+        input, textarea { transition: border-color .2s ease, box-shadow .2s ease; }
+        input:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(74,222,128,.12); }
+    </style>
+</head>
+<body class="bg-slate-900 text-slate-100 font-sans min-h-screen">
+    {% if not session.get('logged_in') %}
+    <div class="flex items-center justify-center min-h-screen p-4">
+        <div class="bg-slate-800 border border-slate-700 rounded-2xl p-8 max-w-md w-full shadow-2xl">
+            <div class="text-center mb-6">
+                <i class="fa-solid fa-shield-halved text-brand-500 text-5xl mb-3"></i>
+                <h2 class="text-2xl font-bold text-white">ARTRICKS Control Panel</h2>
+                <p class="text-xs uppercase tracking-[.25em] text-emerald-400 mt-2">Owner: ALIRAZA · Channel: ARTRICKS</p>
+            </div>
+            {% if error %}<div class="bg-red-500/10 border border-red-500 text-red-400 p-3 rounded-lg mb-4 text-sm text-center">{{ error }}</div>{% endif %}
+            <form action="/login" method="POST" class="space-y-4">
+                <div><label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Username</label><input type="text" name="username" required class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-brand-500"></div>
+                <div><label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Password</label><input type="password" name="password" required class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-brand-500"></div>
+                <button type="submit" class="w-full bg-brand-600 hover:bg-brand-700 text-white font-semibold py-3 rounded-lg transition">Login Panel</button>
+            </form>
+        </div>
+    </div>
+    {% else %}
+    <nav class="bg-slate-800 border-b border-slate-700 sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
+            <div class="flex items-center space-x-3">
+                <i class="fa-solid fa-network-wired text-brand-500 text-2xl"></i>
+                <div class="flex flex-col">
+                    <span class="font-bold text-lg text-white">ARTRICKS VPN Manager</span>
+                    <span class="text-[10px] uppercase tracking-[.22em] text-emerald-400">Owner: ALIRAZA · Channel: ARTRICKS</span>
+                </div>
+            </div>
+            <div class="flex items-center space-x-2 flex-wrap justify-end">
+                <button onclick="toggleServerMessageModal()" class="text-xs bg-emerald-600/20 hover:bg-emerald-600/30 px-3 py-1.5 rounded-lg text-emerald-300 border border-emerald-500/40 flex items-center space-x-1">
+                    <i class="fa-solid fa-message"></i><span>Server Message</span>
+                </button>
+                <button onclick="toggleSettingsModal()" class="text-xs bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-slate-200 border border-slate-600 flex items-center space-x-1">
+                    <i class="fa-solid fa-gear text-brand-500"></i>
+                    <span>⚙️ Settings</span>
+                </button>
+                <a href="/logout" class="text-xs bg-red-600/20 text-red-400 hover:bg-red-600/30 px-3 py-1.5 rounded-lg border border-red-500/30 transition">Logout</a>
+            </div>
+        </div>
+    </nav>
+
+    <div class="max-w-7xl mx-auto p-4 md:p-6 space-y-6">
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+            <div class="panel-card bg-slate-800/95 border border-slate-700 p-4 rounded-xl"><div class="text-xs text-slate-400 uppercase font-semibold mb-1">Total Accounts</div><div class="text-2xl font-bold text-white" id="stat-total-users">0</div></div>
+            <div class="panel-card bg-slate-800/95 border border-slate-700 p-4 rounded-xl"><div class="text-xs text-slate-400 uppercase font-semibold mb-1">Active Online Clients</div><div class="text-2xl font-bold text-emerald-400" id="stat-active-conn">0</div></div>
+            <div class="panel-card bg-slate-800/95 border border-slate-700 p-4 rounded-xl"><div class="text-xs text-slate-400 uppercase font-semibold mb-1">RAM Usage</div><div class="text-2xl font-bold text-white" id="stat-ram">-- %</div></div>
+            <div class="panel-card bg-slate-800/95 border border-slate-700 p-4 rounded-xl"><div class="text-xs text-slate-400 uppercase font-semibold mb-1">CPU Load</div><div class="text-2xl font-bold text-white" id="stat-cpu">-- %</div></div>
+        </div>
+
+        <div class="panel-card bg-slate-800/95 border border-slate-700 p-5 rounded-2xl space-y-4">
+            <div class="flex justify-between items-center border-b border-slate-700/60 pb-3">
+                <h3 class="text-lg font-bold text-white flex items-center">
+                    <i class="fa-solid fa-user-plus text-brand-500 me-2"></i> Create SSH Client
+                </h3>
+                <button onclick="toggleCreateModal()" class="text-xs bg-brand-600 hover:bg-brand-700 px-3.5 py-1.5 rounded-lg text-white font-semibold flex items-center space-x-1.5 shadow-lg shadow-brand-600/30 transition">
+                    <i class="fa-solid fa-plus text-xs"></i>
+                    <span>➕ Create SSH User</span>
+                </button>
+            </div>
+
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead class="bg-slate-900 text-slate-400 uppercase text-xs">
+                        <tr>
+                            <th class="p-3">Client Username</th>
+                            <th class="p-3 text-right">Connection Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="simple-users-table" class="divide-y divide-slate-700">
+                        <tr><td colspan="2" class="p-4 text-center text-slate-500">Loading client accounts...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel-card bg-slate-800/95 border border-slate-700 p-5 rounded-2xl space-y-4">
+            <div class="flex justify-between items-center border-b border-slate-700/60 pb-3">
+                <h3 class="text-lg font-bold text-white flex items-center">
+                    <i class="fa-solid fa-wifi text-emerald-400 me-2"></i> Real Active Connected Clients
+                </h3>
+                <button onclick="fetchData()" class="text-xs bg-slate-700 hover:bg-slate-600 text-slate-300 px-3 py-1.5 rounded-md">Refresh</button>
+            </div>
+
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead class="bg-slate-900 text-slate-400 uppercase text-xs">
+                        <tr><th class="p-3">User</th><th class="p-3">Real Client IP</th><th class="p-3">Status</th></tr>
+                    </thead>
+                    <tbody id="active-sessions-table" class="divide-y divide-slate-700">
+                        <tr><td colspan="3" class="p-4 text-center text-slate-500">Checking active sessions...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="bg-slate-800 border border-slate-700 p-5 rounded-2xl">
+            <h3 class="text-lg font-bold text-white mb-4 flex items-center">
+                <i class="fa-solid fa-users-gear text-brand-500 me-2"></i> Managed Client Accounts
+            </h3>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead class="bg-slate-900 text-slate-400 uppercase text-xs">
+                        <tr>
+                            <th class="p-3">Username</th>
+                            <th class="p-3">IP Limit</th>
+                            <th class="p-3">Bandwidth Used / Total Limit</th>
+                            <th class="p-3">Expiry Date</th>
+                            <th class="p-3">Status</th>
+                            <th class="p-3 text-center">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="users-list-table" class="divide-y divide-slate-700">
+                        <tr><td colspan="6" class="p-4 text-center text-slate-500">Loading accounts...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create SSH Client Dialogue Box -->
+    <div id="create-user-modal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-lg w-full space-y-4 shadow-2xl">
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <h3 class="text-lg font-bold text-white flex items-center"><i class="fa-solid fa-user-plus text-brand-500 me-2"></i> Create New SSH Client</h3>
+                <button onclick="toggleCreateModal()" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            
+            <form id="create-user-form" class="space-y-3">
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Username</label>
+                    <input type="text" id="new-username" required placeholder="Enter username" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Password</label>
+                    <input type="text" id="new-password" required placeholder="Enter password" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Max IP Limit</label>
+                        <input type="number" id="new-ip-limit" value="1" min="1" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Data GB Limit</label>
+                        <input type="text" id="new-gb-limit" value="1" required class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Expiry Days</label>
+                    <input type="number" id="new-expiry-days" value="30" min="1" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div class="flex space-x-3 pt-2">
+                    <button type="button" onclick="toggleCreateModal()" class="w-1/3 bg-slate-700 hover:bg-slate-600 text-slate-200 font-semibold py-2.5 rounded-lg text-sm transition">Cancel</button>
+                    <button type="submit" class="w-2/3 bg-brand-600 hover:bg-brand-700 text-white font-semibold py-2.5 rounded-lg text-sm transition flex items-center justify-center space-x-1 shadow-lg shadow-brand-600/30">
+                        <i class="fa-solid fa-user-plus me-1"></i> Create Client
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Edit User Dialogue Box -->
+    <div id="edit-user-modal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-lg w-full space-y-4 shadow-2xl">
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <h3 class="text-lg font-bold text-white flex items-center"><i class="fa-solid fa-user-pen text-brand-500 me-2"></i> Edit Client Account</h3>
+                <button onclick="closeEditModal()" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            
+            <input type="hidden" id="edit-old-username">
+
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Username</label>
+                    <input type="text" id="edit-username" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">New Password (Leave blank to keep unchanged)</label>
+                    <input type="text" id="edit-password" placeholder="Enter new password" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                </div>
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Max IP Limit</label>
+                        <input type="number" id="edit-ip-limit" min="1" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Data GB Limit</label>
+                        <input type="text" id="edit-gb-limit" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-semibold uppercase text-slate-400 mb-1">Expiry Date (YYYY-MM-DD)</label>
+                    <input type="date" id="edit-expiry-date" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none focus:border-brand-500">
+                </div>
+            </div>
+
+            <div class="flex space-x-3 pt-2">
+                <button onclick="closeEditModal()" class="w-1/3 bg-slate-700 hover:bg-slate-600 text-slate-200 font-semibold py-2.5 rounded-lg text-sm transition">Cancel</button>
+                <button onclick="saveUserEdits()" class="w-2/3 bg-brand-600 hover:bg-brand-700 text-white font-semibold py-2.5 rounded-lg text-sm transition flex items-center justify-center space-x-1">
+                    <i class="fa-solid fa-floppy-disk me-1"></i> Save Changes
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Server Message Modal -->
+    <div id="server-message-modal" class="hidden fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-800 border border-emerald-500/30 rounded-2xl p-6 max-w-xl w-full space-y-4 shadow-2xl">
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <h3 class="text-lg font-bold text-white"><i class="fa-solid fa-message text-emerald-400 me-2"></i> Server Message</h3>
+                <button onclick="toggleServerMessageModal()" class="text-slate-400 hover:text-white text-2xl">&times;</button>
+            </div>
+            <p class="text-sm text-slate-400">Yahan likha message SSH/Dropbear connection banner mein show hoga.</p>
+            <textarea id="server-message-input" rows="7" maxlength="4000" placeholder="Enter server message..." class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-sm text-white focus:outline-none focus:border-emerald-400 resize-y"></textarea>
+            <div class="flex gap-3">
+                <button onclick="toggleServerMessageModal()" class="w-1/3 bg-slate-700 hover:bg-slate-600 text-slate-200 font-semibold py-2.5 rounded-lg text-sm">Cancel</button>
+                <button onclick="saveServerMessage()" class="w-2/3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2.5 rounded-lg text-sm"><i class="fa-solid fa-floppy-disk me-1"></i> Save Server Message</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-800 border border-slate-700 rounded-2xl p-6 max-w-xl w-full space-y-5">
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <h3 class="text-lg font-bold text-white"><i class="fa-solid fa-gear text-brand-500 me-2"></i> Panel Settings</h3>
+                <button onclick="toggleSettingsModal()" class="text-slate-400 hover:text-white text-xl">&times;</button>
+            </div>
+            <div class="space-y-3">
+                <h4 class="text-xs font-semibold text-brand-500 uppercase">1. Domain & Auto SSL Setup</h4>
+                <div><input type="text" id="domain-input" placeholder="e.g. ind.alyan.tech" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none"></div>
+                <div class="flex space-x-2">
+                    <button onclick="saveDomain()" class="w-1/2 bg-amber-600 hover:bg-amber-700 text-white font-semibold py-2 rounded-lg text-xs">Save Domain</button>
+                    <button onclick="issueSSL()" class="w-1/2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold py-2 rounded-lg text-xs">Auto Install SSL</button>
+                </div>
+            </div>
+            <hr class="border-slate-700">
+            <div class="space-y-3">
+                <h4 class="text-xs font-semibold text-brand-500 uppercase">2. Change Web Admin Password</h4>
+                <div class="grid grid-cols-2 gap-3">
+                    <div><label class="block text-xs text-slate-400 mb-1">New Admin ID</label><input type="text" id="new-admin-user" placeholder="admin" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none"></div>
+                    <div><label class="block text-xs text-slate-400 mb-1">New Admin Password</label><input type="password" id="new-admin-pass" placeholder="••••••••" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2.5 text-sm text-white focus:outline-none"></div>
+                </div>
+                <button onclick="changeAdminCreds()" class="w-full bg-brand-600 hover:bg-brand-700 text-white font-semibold py-2 rounded-lg text-xs">Update Panel Credentials</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-container" class="fixed bottom-5 left-5 z-50 space-y-3 pointer-events-none"></div>
+
+    <script>
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            
+            let bgClass = 'bg-emerald-600/90 border-emerald-400 text-emerald-100';
+            let icon = '<i class="fa-solid fa-circle-check text-lg me-2"></i>';
+            
+            if(type === 'error') {
+                bgClass = 'bg-red-600/90 border-red-400 text-red-100';
+                icon = '<i class="fa-solid fa-circle-xmark text-lg me-2"></i>';
+            } else if(type === 'warning') {
+                bgClass = 'bg-amber-600/90 border-amber-400 text-amber-100';
+                icon = '<i class="fa-solid fa-triangle-exclamation text-lg me-2"></i>';
+            }
+
+            toast.className = `animate-toast pointer-events-auto flex items-center px-4 py-3 rounded-xl border shadow-2xl text-xs font-semibold backdrop-blur-md ${bgClass}`;
+            toast.innerHTML = `${icon} <span>${message}</span>`;
+            
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.transition = 'all 0.3s ease-out';
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateX(-100%)';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        function toggleSettingsModal() { document.getElementById('settings-modal').classList.toggle('hidden'); }
+        function toggleCreateModal() { document.getElementById('create-user-modal').classList.toggle('hidden'); }
+        function closeEditModal() { document.getElementById('edit-user-modal').classList.add('hidden'); }
+
+        let cachedUsers = {};
+
+        async function fetchData() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                cachedUsers = data.users;
+                
+                if(!document.getElementById('domain-input').value) { document.getElementById('domain-input').value = data.domain; }
+                document.getElementById('stat-ram').innerText = data.ram + '%';
+                document.getElementById('stat-cpu').innerText = data.cpu + '%';
+                document.getElementById('stat-total-users').innerText = Object.keys(data.users).length;
+                document.getElementById('stat-active-conn').innerText = data.active_sessions.length;
+
+                const activeUsersSet = new Set(data.active_sessions.map(s => s.user));
+
+                // 1. Simple Users Table
+                const simpleTable = document.getElementById('simple-users-table');
+                const usersKeys = Object.keys(data.users);
+                
+                if (usersKeys.length === 0) {
+                    simpleTable.innerHTML = `<tr><td colspan="2" class="p-4 text-center text-slate-500">Koi account create nahi hua</td></tr>`;
+                } else {
+                    simpleTable.innerHTML = usersKeys.map(uname => {
+                        const u = data.users[uname];
+                        const isLocked = u.status === 'LOCKED';
+                        const isOnline = activeUsersSet.has(uname);
+
+                        let badge = "";
+                        if (isLocked) {
+                            badge = `<span class="px-2.5 py-0.5 rounded-full text-xs bg-red-500/20 text-red-400 border border-red-500/30 font-bold">⛔ LOCKED</span>`;
+                        } else if (isOnline) {
+                            badge = `<span class="px-2.5 py-0.5 rounded-full text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">🟢 ONLINE</span>`;
+                        } else {
+                            badge = `<span class="px-2.5 py-0.5 rounded-full text-xs bg-rose-500/20 text-rose-400 border border-rose-500/30 font-bold">🔴 OFFLINE</span>`;
+                        }
+
+                        return `
+                            <tr class="hover:bg-slate-700/50">
+                                <td class="p-3 font-semibold text-white">${uname}</td>
+                                <td class="p-3 text-right">${badge}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+
+                // 2. Active Sessions Table
+                const sessionTable = document.getElementById('active-sessions-table');
+                if (data.active_sessions.length === 0) {
+                    sessionTable.innerHTML = `<tr><td colspan="3" class="p-4 text-center text-slate-500">Filhal koi client connected nahi hai</td></tr>`;
+                } else {
+                    sessionTable.innerHTML = data.active_sessions.map(s => `
+                        <tr class="hover:bg-slate-700/50">
+                            <td class="p-3 font-semibold text-white">${s.user}</td>
+                            <td class="p-3 font-mono text-emerald-400 font-bold">${s.ip}</td>
+                            <td class="p-3"><span class="px-2.5 py-0.5 rounded-full text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">🟢 ONLINE</span></td>
+                        </tr>
+                    `).join('');
+                }
+
+                // 3. Managed Accounts Table (With New 📋 Edit & ♻️ Reset Data Icons)
+                const usersTable = document.getElementById('users-list-table');
+                if (usersKeys.length === 0) {
+                    usersTable.innerHTML = `<tr><td colspan="6" class="p-4 text-center text-slate-500">Koi SSH client create nahi hua</td></tr>`;
+                } else {
+                    usersTable.innerHTML = usersKeys.map(uname => {
+                        const u = data.users[uname];
+                        const isLocked = u.status === 'LOCKED';
+                        const isOnline = activeUsersSet.has(uname);
+
+                        let statusBadge = "";
+                        if (isLocked) {
+                            statusBadge = `<span class="px-2.5 py-0.5 rounded-full text-xs bg-red-500/20 text-red-400 border border-red-500/30 font-bold">⛔ LOCKED</span>`;
+                        } else if (isOnline) {
+                            statusBadge = `<span class="px-2.5 py-0.5 rounded-full text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-bold">🟢 ONLINE</span>`;
+                        } else {
+                            statusBadge = `<span class="px-2.5 py-0.5 rounded-full text-xs bg-rose-500/20 text-rose-400 border border-rose-500/30 font-bold">🔴 OFFLINE</span>`;
+                        }
+
+                        return `
+                            <tr class="hover:bg-slate-700/50">
+                                <td class="p-3 font-semibold text-white">${uname}</td>
+                                <td class="p-3 text-slate-300">${u.ip_limit} Device(s)</td>
+                                <td class="p-3 text-slate-300 font-mono text-xs">
+                                    <span class="text-emerald-400 font-bold">${u.used_str}</span> / <span class="text-amber-400 font-bold">${u.gb_limit} GB</span>
+                                </td>
+                                <td class="p-3 text-slate-400 font-mono text-xs">${u.expiry}</td>
+                                <td class="p-3">${statusBadge}</td>
+                                <td class="p-3 text-center space-x-2 text-base">
+                                    <button onclick="openEditModal('${uname}')" title="Edit Full Account" class="hover:scale-125 transition">📋</button>
+                                    <button onclick="resetUserBandwidth('${uname}')" title="Reset Data Traffic" class="hover:scale-125 transition">♻️</button>
+                                    <button onclick="toggleDisableUser('${uname}', '${isLocked}')" title="${isLocked ? 'Unlock' : 'Disable'}" class="hover:scale-125 transition">⛔</button>
+                                    <button onclick="deleteUser('${uname}')" title="Delete" class="hover:scale-125 transition">❌</button>
+                                </td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+            } catch (err) {}
+        }
+
+        function openEditModal(username) {
+            const user = cachedUsers[username];
+            if(!user) return;
+
+            document.getElementById('edit-old-username').value = username;
+            document.getElementById('edit-username').value = username;
+            document.getElementById('edit-password').value = "";
+            document.getElementById('edit-ip-limit').value = user.ip_limit || 1;
+            document.getElementById('edit-gb-limit').value = user.gb_limit || 1;
+            
+            try {
+                const expDate = new Date(user.expiry);
+                if (!isNaN(expDate.getTime())) {
+                    document.getElementById('edit-expiry-date').value = expDate.toISOString().split('T')[0];
+                } else { document.getElementById('edit-expiry-date').value = ""; }
+            } catch(e) { document.getElementById('edit-expiry-date').value = ""; }
+
+            document.getElementById('edit-user-modal').classList.remove('hidden');
+        }
+
+        async function saveUserEdits() {
+            const oldUser = document.getElementById('edit-old-username').value;
+            const newUser = document.getElementById('edit-username').value.trim();
+            const password = document.getElementById('edit-password').value.trim();
+            const ipLimit = document.getElementById('edit-ip-limit').value;
+            const gbLimit = document.getElementById('edit-gb-limit').value;
+            const expiryDate = document.getElementById('edit-expiry-date').value;
+
+            if(!newUser) return showToast("Username is required!", "warning");
+
+            const payload = { old_username: oldUser, new_username: newUser, password: password, ip_limit: ipLimit, gb_limit: gbLimit, expiry_date: expiryDate };
+
+            const res = await fetch('/api/edit-user', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const data = await res.json();
+            if(data.success) {
+                closeEditModal();
+                showToast(data.message, "success");
+                fetchData();
+            } else {
+                showToast(data.message, "error");
+            }
+        }
+
+        async function resetUserBandwidth(username) {
+            const res = await fetch('/api/reset-bandwidth', { 
+                method: 'POST', 
+                headers: { 'Content-Type': 'application/json' }, 
+                body: JSON.stringify({ username }) 
+            });
+            const data = await res.json();
+            if(data.success) {
+                showToast(data.message, "success");
+                fetchData();
+            } else {
+                showToast(data.message, "error");
+            }
+        }
+
+        function toggleServerMessageModal() {
+            const modal = document.getElementById('server-message-modal');
+            const opening = modal.classList.contains('hidden');
+            modal.classList.toggle('hidden');
+            if (opening) loadServerMessage();
+        }
+
+        async function loadServerMessage() {
+            try {
+                const res = await fetch('/api/server-message');
+                const data = await res.json();
+                if (res.ok) document.getElementById('server-message-input').value = data.message || '';
+                else showToast(data.error || 'Could not load server message', 'error');
+            } catch (e) { showToast('Could not load server message', 'error'); }
+        }
+
+        async function saveServerMessage() {
+            const message = document.getElementById('server-message-input').value;
+            try {
+                const res = await fetch('/api/server-message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+                const data = await res.json();
+                showToast(data.message || data.error || 'Request finished', data.success ? 'success' : 'error');
+                if (data.success) toggleServerMessageModal();
+            } catch (e) { showToast('Could not save server message', 'error'); }
+        }
+
+        async function saveDomain() {
+            const domain = document.getElementById('domain-input').value.trim();
+            if(!domain) return showToast("Domain name enter karein!", "warning");
+            const res = await fetch('/api/set-domain', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ domain }) });
+            const data = await res.json(); 
+            showToast(data.message, data.success ? "success" : "error"); 
+            fetchData();
+        }
+
+        async function issueSSL() {
+            showToast("Auto SSL Installation process start ho gaya hai...", "warning");
+            const res = await fetch('/api/issue-ssl', { method: 'POST' });
+            const data = await res.json(); 
+            showToast(data.message, data.success ? "success" : "error"); 
+            fetchData();
+        }
+
+        async function changeAdminCreds() {
+            const user = document.getElementById('new-admin-user').value.trim();
+            const pass = document.getElementById('new-admin-pass').value.trim();
+            if(!user || !pass) return showToast("Credentials fill karein!", "warning");
+            const res = await fetch('/api/change-creds', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: user, password: pass }) });
+            const data = await res.json(); 
+            showToast(data.message, "success");
+            if(data.success) setTimeout(() => location.reload(), 1000);
+        }
+
+        document.getElementById('create-user-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const payload = { username: document.getElementById('new-username').value, password: document.getElementById('new-password').value, ip_limit: document.getElementById('new-ip-limit').value, gb_limit: document.getElementById('new-gb-limit').value, expiry_days: document.getElementById('new-expiry-days').value };
+            const res = await fetch('/api/create-user', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            const result = await res.json(); 
+            if(result.success) {
+                toggleCreateModal();
+                showToast(result.message, "success");
+                document.getElementById('create-user-form').reset(); 
+                fetchData();
+            } else {
+                showToast(result.message, "error");
+            }
+        });
+
+        async function toggleDisableUser(username, isLocked) {
+            const action = isLocked === 'true' ? 'unlock' : 'lock';
+            const res = await fetch('/api/toggle-lock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, action }) });
+            const data = await res.json(); 
+            showToast(data.message, action === 'lock' ? "warning" : "success"); 
+            fetchData();
+        }
+
+        async function deleteUser(username) {
+            const res = await fetch('/api/delete-user', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
+            const data = await res.json();
+            showToast(data.message, "error");
+            fetchData();
+        }
+
+        setInterval(fetchData, 2000); fetchData();
+    </script>
+    {% endif %}
+</body>
+</html>
+"""
+
+@app.route('/', methods=['GET', 'POST'])
+def index(): 
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    cfg = load_config()
+    if request.method == 'POST':
+        if request.form.get('username') == cfg['admin_user'] and request.form.get('password') == cfg['admin_pass']:
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        return render_template_string(HTML_TEMPLATE, error="Invalid Credentials!")
+    
+    if session.get('logged_in'):
+        return redirect(url_for('index'))
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/logout', methods=['GET', 'POST'])
+def logout(): 
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/api/server-message', methods=['GET', 'POST'])
+def api_server_message():
+    if not session.get('logged_in'):
+        return jsonify({"error": "Unauthorized"}), 401
+    banner_path = "/etc/issue.net"
+    if request.method == 'GET':
+        try:
+            with open(banner_path, "r", encoding="utf-8", errors="replace") as f:
+                message = f.read()
+        except FileNotFoundError:
+            message = ""
+        except Exception:
+            return jsonify({"error": "Could not read server message"}), 500
+        return jsonify({"message": message})
+    data = request.get_json(silent=True) or {}
+    message = data.get('message', '')
+    if not isinstance(message, str):
+        return jsonify({"success": False, "message": "Message must be text"}), 400
+    if len(message) > 4000:
+        return jsonify({"success": False, "message": "Message is too long (max 4000 characters)"}), 400
+    try:
+        with open(banner_path, "w", encoding="utf-8") as f:
+            f.write(message)
+        return jsonify({"success": True, "message": "Server message saved successfully!"})
+    except Exception:
+        return jsonify({"success": False, "message": "Could not save server message"}), 500
+
+@app.route('/api/stats', methods=['GET', 'POST'])
+def api_stats():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    ram = run_cmd("free -m | awk 'NR==2{printf \"%.1f\", $3*100/$2 }'")
+    cpu = run_cmd("top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}'")
+    
+    active_sessions = []
+    seen_users = set()
+    
+    raw_logs = run_cmd("journalctl -u dropbear --no-pager -n 400 2>/dev/null")
+    if os.path.exists("/var/log/auth.log"):
+        try:
+            with open("/var/log/auth.log", "r") as f:
+                raw_logs += "\n" + f.read()
+        except Exception: pass
+
+    external_ips = run_cmd("ss -tnp 2>/dev/null | grep -E ':(80|443|2082)' | grep 'ESTAB' | awk '{print $5}' | cut -d: -f1 | grep -vE '^127\.|^::1' | sort -u").splitlines()
+    ws_logged_ips = run_cmd("grep -oP '(?<=REAL_IP:)\\S+' /var/log/ws-proxy.log 2>/dev/null | tail -n 20 | sort -u").splitlines()
+    
+    real_ip_pool = list(dict.fromkeys([ip for ip in (external_ips + ws_logged_ips) if ip]))
+    ip_index = 0
+
+    pids_out = run_cmd("ps aux | grep dropbear | grep -v grep | awk '{print $2}'").splitlines()
+    
+    for pid in pids_out:
+        if not pid: continue
+        user_matches = [l for l in raw_logs.splitlines() if f"dropbear[{pid}]" in l and "Password auth succeeded" in l]
+        if user_matches:
+            last_line = user_matches[-1]
+            m = re.search(r"for \x27(\w+)\x27", last_line)
+            if not m:
+                m = re.search(r"for (\w+)", last_line)
+            
+            if m:
+                uname = m.group(1)
+                if uname in seen_users:
+                    continue
+                
+                seen_users.add(uname)
+                ip_match = re.search(r"from (\S+?):", last_line)
+                logged_ip = ip_match.group(1) if ip_match else ""
+                
+                final_ip = logged_ip
+                if not logged_ip or logged_ip == "127.0.0.1":
+                    if ip_index < len(real_ip_pool):
+                        final_ip = real_ip_pool[ip_index]
+                        ip_index += 1
+                    else:
+                        final_ip = "104.16.79.73"
+
+                active_sessions.append({"user": uname, "ip": final_ip})
+
+    return jsonify({"domain": get_domain(), "ram": ram or "0", "cpu": cpu or "0", "users": get_users_data(), "active_sessions": active_sessions})
+
+@app.route('/api/reset-bandwidth', methods=['GET', 'POST'])
+def reset_bandwidth():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    u = d.get('username', '').strip()
+    conf_path = f"{USER_DIR}/{u}.conf"
+    
+    if os.path.exists(conf_path):
+        lines = []
+        with open(conf_path, "r") as f: lines = f.readlines()
+        new_lines = []
+        for line in lines:
+            if line.startswith("USED_MB="):
+                new_lines.append("USED_MB=0.0\n")
+            else:
+                new_lines.append(line)
+        with open(conf_path, "w") as f: f.writelines(new_lines)
+
+        run_cmd(f"passwd -u {u} 2>/dev/null")
+        return jsonify({"success": True, "message": f"Data Traffic Reset to 0 MB for '{u}'!"})
+    
+    return jsonify({"success": False, "message": "User config not found!"})
+
+@app.route('/api/edit-user', methods=['GET', 'POST'])
+def edit_user():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    old_u = d.get('old_username','').strip()
+    new_u = d.get('new_username','').strip()
+    passw = d.get('password','').strip()
+    ip_lim = d.get('ip_limit','1').strip()
+    gb_lim = d.get('gb_limit','1').strip()
+    exp_date = d.get('expiry_date','').strip()
+
+    if not old_u or not new_u:
+        return jsonify({"success": False, "message": "Invalid Username!"})
+
+    if old_u != new_u:
+        run_cmd(f"pkill -9 -u {old_u}")
+        run_cmd(f"usermod -l {new_u} {old_u}")
+        if os.path.exists(f"{USER_DIR}/{old_u}.conf"):
+            os.rename(f"{USER_DIR}/{old_u}.conf", f"{USER_DIR}/{new_u}.conf")
+
+    target_u = new_u
+
+    if passw:
+        run_cmd(f"echo '{target_u}:{passw}' | chpasswd")
+        run_cmd(f"passwd -u {target_u} 2>/dev/null")
+
+    if exp_date:
+        run_cmd(f"usermod -e '{exp_date}' {target_u}")
+
+    conf_path = f"{USER_DIR}/{target_u}.conf"
+    used_mb = 0.0
+    if os.path.exists(conf_path):
+        with open(conf_path, "r") as f:
+            for line in f:
+                if line.startswith("USED_MB="):
+                    try: used_mb = float(line.strip().split("=")[1])
+                    except: pass
+
+    with open(conf_path, "w") as f:
+        f.write(f"IP_LIMIT={ip_lim}\nGB_LIMIT={gb_lim}\nUSED_MB={used_mb:.4f}\n")
+
+    return jsonify({"success": True, "message": f"Account '{target_u}' Updated Successfully!"})
+
+@app.route('/api/change-creds', methods=['GET', 'POST'])
+def change_creds():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    u = d.get('username','').strip()
+    p = d.get('password','').strip()
+    save_config({"admin_user": u, "admin_pass": p})
+    return jsonify({"success": True, "message": "Admin Credentials updated!"})
+
+@app.route('/api/set-domain', methods=['GET', 'POST'])
+def set_domain():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    domain = d.get('domain', '').strip()
+    if not domain: domain = DEFAULT_DOMAIN
+    with open(DOMAIN_FILE, "w") as f: f.write(domain)
+    apply_nginx_config(domain)
+    return jsonify({"success": True, "message": f"Domain updated to {domain}!"})
+
+@app.route('/api/issue-ssl', methods=['GET', 'POST'])
+def issue_ssl():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    domain = get_domain()
+    run_cmd("systemctl stop nginx")
+    run_cmd(f"certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d {domain} --non-interactive")
+    apply_nginx_config(domain)
+    return jsonify({"success": True, "message": f"SSL Process Finished for {domain}!"})
+
+@app.route('/api/create-user', methods=['GET', 'POST'])
+def create_user():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    u, p = d.get('username','').strip(), d.get('password','').strip()
+    exp = (datetime.datetime.now() + datetime.timedelta(days=int(d.get('expiry_days', 30)))).strftime('%Y-%m-%d')
+    run_cmd(f"useradd -M -s /bin/false -e '{exp}' {u}")
+    run_cmd(f"echo '{u}:{p}' | chpasswd")
+    with open(f"{USER_DIR}/{u}.conf", "w") as f:
+        f.write(f"IP_LIMIT={d.get('ip_limit', '1')}\nGB_LIMIT={d.get('gb_limit', '1')}\nUSED_MB=0.0\n")
+    return jsonify({"success": True, "message": f"Account '{u}' Created Successfully!"})
+
+@app.route('/api/toggle-lock', methods=['GET', 'POST'])
+def toggle_lock():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    u = d.get('username')
+    action = d.get('action')
+    if action == 'lock':
+        run_cmd(f"passwd -l {u}")
+        run_cmd(f"pkill -9 -u {u}")
+        run_cmd(f"killall -9 -u {u} 2>/dev/null")
+        run_cmd("systemctl restart ws-proxy")
+        msg = f"User '{u}' Disabled and Disconnected!"
+    else:
+        run_cmd(f"passwd -u {u}")
+        msg = f"User '{u}' Unlocked & Activated!"
+    return jsonify({"success": True, "message": msg})
+
+@app.route('/api/delete-user', methods=['GET', 'POST'])
+def delete_user():
+    if not session.get('logged_in'): return jsonify({"error": "Unauthorized"}), 401
+    d = request.json or {}
+    u = d.get('username')
+    run_cmd(f"pkill -9 -u {u}")
+    run_cmd("systemctl restart ws-proxy")
+    run_cmd(f"userdel -f {u}")
+    if os.path.exists(f"{USER_DIR}/{u}.conf"): os.remove(f"{USER_DIR}/{u}.conf")
+    return jsonify({"success": True, "message": f"Account '{u}' Deleted!"})
+
+if __name__ == '__main__':
+    apply_nginx_config(DEFAULT_DOMAIN)
+    app.run(host='0.0.0.0', port=2026, debug=False)
+PYTHON_EOF
+
+# 5. Deploy Optimized Bandwidth Tracker (autokill.py)
+echo -e "${BLUE}[3/7] Deploying Bandwidth Tracker...${NC}"
+cat << 'PY_EOF' > /usr/local/bin/autokill.py
+import os, sys, time, subprocess, re
+
+USER_DIR = "/etc/raretriccks/users"
+
+def get_auth_logs():
+    raw = ""
+    try:
+        raw = subprocess.check_output(["journalctl", "-u", "dropbear", "--no-pager", "-n", "100"], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
+    except Exception: pass
+    return raw
+
+def get_active_users_and_pids(raw_logs):
+    user_pids = {}
+    try:
+        ps_out = subprocess.check_output(["ps", "aux"], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
+        for line in ps_out.splitlines():
+            if "dropbear" in line and "grep" not in line:
+                parts = line.split()
+                if len(parts) > 1:
+                    pid = parts[1]
+                    matches = [l for l in raw_logs.splitlines() if f"dropbear[{pid}]" in l and "Password auth succeeded" in l]
+                    if matches:
+                        last_line = matches[-1]
+                        m = re.search(r"for \x27(\w+)\x27", last_line)
+                        if not m: m = re.search(r"for (\w+)", last_line)
+                        if m:
+                            uname = m.group(1)
+                            if uname not in user_pids: user_pids[uname] = []
+                            user_pids[uname].append(pid)
+    except Exception: pass
+    return user_pids
+
+def get_pid_io_bytes(pid):
+    io_file = f"/proc/{pid}/io"
+    total_bytes = 0
+    if os.path.exists(io_file):
+        try:
+            with open(io_file, "r") as f:
+                for line in f:
+                    if line.startswith("rchar:") or line.startswith("wchar:"):
+                        total_bytes += int(line.split(":")[1].strip())
+        except Exception: pass
+    return total_bytes
+
+last_pid_bytes = {}
+
+while True:
+    try:
+        raw_logs = get_auth_logs()
+        user_pids_map = get_active_users_and_pids(raw_logs)
+
+        if os.path.exists(USER_DIR):
+            for fname in os.listdir(USER_DIR):
+                if not fname.endswith(".conf"): continue
+                uname = fname[:-5]
+                conf_path = os.path.join(USER_DIR, fname)
+                
+                ip_limit = 1
+                gb_limit = "Unlimited"
+                used_mb = 0.0
+
+                with open(conf_path, "r") as f: lines = f.readlines()
+                for line in lines:
+                    if line.startswith("IP_LIMIT="):
+                        try: ip_limit = int(line.strip().split("=")[1])
+                        except Exception: pass
+                    elif line.startswith("GB_LIMIT="): gb_limit = line.strip().split("=")[1]
+                    elif line.startswith("USED_MB="):
+                        try: used_mb = float(line.strip().split("=")[1])
+                        except Exception: pass
+
+                active_pids = user_pids_map.get(uname, [])
+
+                delta_mb = 0.0
+                for pid in active_pids:
+                    current_b = get_pid_io_bytes(pid)
+                    if pid in last_pid_bytes:
+                        diff = current_b - last_pid_bytes[pid]
+                        if diff > 0:
+                            delta_mb += (diff / (1024.0 * 1024.0))
+                    last_pid_bytes[pid] = current_b
+
+                if delta_mb > 0:
+                    used_mb += delta_mb
+                    new_lines = []
+                    for line in lines:
+                        if line.startswith("USED_MB="):
+                            new_lines.append(f"USED_MB={used_mb:.4f}\n")
+                        else:
+                            new_lines.append(line)
+                    with open(conf_path, "w") as f: f.writelines(new_lines)
+
+                if gb_limit != "Unlimited":
+                    try:
+                        max_mb = float(gb_limit) * 1024.0
+                        if used_mb >= max_mb:
+                            subprocess.call(["passwd", "-l", uname], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            for pid in active_pids:
+                                subprocess.call(["kill", "-9", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except Exception: pass
+
+                if ip_limit > 0 and len(active_pids) > ip_limit:
+                    subprocess.call(["passwd", "-l", uname], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    for pid in active_pids:
+                        subprocess.call(["kill", "-9", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    except Exception: pass
+    time.sleep(5)
+PY_EOF
+
+# 6. Deploy Ultra-Fast WebSocket Proxy (ws-proxy.py)
+echo -e "${BLUE}[4/7] Deploying Fast WebSocket Proxy Engine...${NC}"
+cat << 'WS_EOF' > /usr/local/bin/ws-proxy.py
+import socket, threading, select, time
+
+PORT = 2082
+TARGET_HOST = '127.0.0.1'
+TARGET_PORT = 109
+LOG_FILE = '/var/log/ws-proxy.log'
+
+def log_client_ip(ip):
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - REAL_IP:{ip}\n")
+    except Exception: pass
+
+def handle_client(client_socket, client_addr):
+    real_ip = client_addr[0]
+    try:
+        client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        client_socket.settimeout(10)
+        request = client_socket.recv(4096).decode('utf-8', errors='ignore')
+        if not request:
+            client_socket.close()
+            return
+
+        for line in request.split('\r\n'):
+            line_l = line.lower()
+            if line_l.startswith('cf-connecting-ip:'):
+                real_ip = line.split(':')[1].strip()
+                break
+            elif line_l.startswith('x-forwarded-for:'):
+                parts = line.split(':')
+                if len(parts) > 1: real_ip = parts[1].strip().split(',')[0].strip()
+            elif line_l.startswith('x-real-ip:'):
+                parts = line.split(':')
+                if len(parts) > 1: real_ip = parts[1].strip().split(',')[0].strip()
+
+        log_client_ip(real_ip)
+
+        response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        client_socket.sendall(response.encode('utf-8'))
+
+        target_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        target_socket.connect((TARGET_HOST, TARGET_PORT))
+
+        sockets = [client_socket, target_socket]
+        client_socket.settimeout(None)
+
+        while True:
+            readable, _, _ = select.select(sockets, [], [], 30)
+            if not readable: break
+            for s in readable:
+                other = target_socket if s is client_socket else client_socket
+                data = s.recv(16384)
+                if not data:
+                    client_socket.close()
+                    target_socket.close()
+                    return
+                other.sendall(data)
+    except Exception: pass
+    finally:
+        try: client_socket.close()
+        except: pass
+        try: target_socket.close()
+        except: pass
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('0.0.0.0', PORT))
+server.listen(500)
+
+while True:
+    client, addr = server.accept()
+    threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
+WS_EOF
+
+# 7. Configure Dropbear Core & Fix All Auth Issues
+echo -e "${BLUE}[5/7] Configuring & Fixing Dropbear SSH Core...${NC}"
+cat << 'DB_EOF' > /etc/default/dropbear
+NO_START=0
+DROPBEAR_PORT=109
+DROPBEAR_EXTRA_ARGS="-p 447 -b /etc/issue.net"
+DROPBEAR_BANNER="/etc/issue.net"
+DROPBEAR_RECEIVE_WINDOW=65536
+DB_EOF
+
+touch /etc/issue.net
+chmod 644 /etc/shadow 2>/dev/null
+
+# TCP Buffer Optimization
+cat << 'SYS_EOF' >> /etc/sysctl.conf
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.netdev_max_backlog = 10000
+SYS_EOF
+sysctl -p 2>/dev/null
+
+# 8. Create Terminal Menu Command (/usr/local/bin/menu & /usr/bin/menu)
+echo -e "${BLUE}[6/7] Setting Up Interactive Terminal Menu...${NC}"
+cat << 'MENU_EOF' > /usr/local/bin/menu
+#!/bin/bash
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+press_any_key() {
+    echo -e "\n${YELLOW}Press [ENTER] key to return to menu...${NC}"
+    read -r
+}
+
+while true; do
+    clear
+    DOMAIN=$(cat /etc/raretriccks/domain.conf 2>/dev/null || echo "ind.alyan.tech")
+    IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+    
+    WEB_STATUS=$(systemctl is-active raretriccks-web 2>/dev/null)
+    WS_STATUS=$(systemctl is-active ws-proxy 2>/dev/null)
+    AK_STATUS=$(systemctl is-active autokill 2>/dev/null)
+    DB_STATUS=$(systemctl is-active dropbear 2>/dev/null)
+
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "${GREEN}       ARTRICKS VPN & Web Manager Terminal Menu  ${NC}"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e " VPS Server IP  : ${YELLOW}${IP}${NC}"
+    echo -e " Current Domain : ${YELLOW}${DOMAIN}${NC}"
+    echo -e " Web Panel URL  : ${CYAN}http://${IP}:2026${NC} or ${CYAN}https://${DOMAIN}${NC}"
+    echo -e "${CYAN}----------------------------------------------------${NC}"
+    echo -e " Web Dashboard  : [ ${WEB_STATUS^^} ]"
+    echo -e " Dropbear SSH   : [ ${DB_STATUS^^} ]"
+    echo -e " WebSocket Proxy: [ ${WS_STATUS^^} ]"
+    echo -e " Autokill Daemon: [ ${AK_STATUS^^} ]"
+    echo -e "${CYAN}----------------------------------------------------${NC}"
+    echo -e " 1) Change Web Panel Username & Password"
+    echo -e " 2) Add / Change Domain Name"
+    echo -e " 3) Issue Auto SSL Certificate (Certbot)"
+    echo -e " 4) View System & Web Panel Logs"
+    echo -e " 5) View Panel Status & Information"
+    echo -e " 6) Completely Uninstall Panel"
+    echo -e " 0) Exit Menu"
+    echo -e "${CYAN}====================================================${NC}"
+    read -rp "Select Option [0-6]: " opt
+
+    case $opt in
+        1)
+            clear
+            echo -e "${CYAN}=== Change Panel Admin Credentials ===${NC}"
+            read -rp "Enter New Admin Username: " new_u
+            read -rp "Enter New Admin Password: " new_p
+            if [[ -n "$new_u" && -n "$new_p" ]]; then
+                python3 -c "import json; f=open('/etc/raretriccks/panel_config.json','w'); json.dump({'admin_user':'$new_u','admin_pass':'$new_p'},f); f.close()"
+                systemctl restart raretriccks-web
+                echo -e "${GREEN}[SUCCESS] Web Panel credentials updated successfully!${NC}"
+            else
+                echo -e "${RED}[ERROR] Username ya Password khali nahi chhod sakte!${NC}"
+            fi
+            press_any_key
+            ;;
+        2)
+            clear
+            echo -e "${CYAN}=== Change Domain Name ===${NC}"
+            read -rp "Enter Domain Name (e.g. ind.alyan.tech): " new_dom
+            if [[ -n "$new_dom" ]]; then
+                echo "$new_dom" > /etc/raretriccks/domain.conf
+                python3 -c "import sys; sys.path.append('/usr/local/bin'); import raretriccks_web; raretriccks_web.apply_nginx_config('$new_dom')"
+                echo -e "${GREEN}[SUCCESS] Domain set to $new_dom${NC}"
+            else
+                echo -e "${RED}[ERROR] Domain khali nahi chhod sakte!${NC}"
+            fi
+            press_any_key
+            ;;
+        3)
+            clear
+            echo -e "${CYAN}=== Issue Auto SSL Certificate ===${NC}"
+            DOM=$(cat /etc/raretriccks/domain.conf 2>/dev/null)
+            if [[ -z "$DOM" ]]; then
+                echo -e "${RED}[ERROR] Pehle Option 2 se Domain Add karein!${NC}"
+            else
+                systemctl stop nginx
+                certbot certonly --standalone --preferred-challenges http --agree-tos --register-unsafely-without-email -d "$DOM" --non-interactive
+                python3 -c "import sys; sys.path.append('/usr/local/bin'); import raretriccks_web; raretriccks_web.apply_nginx_config('$DOM')"
+                echo -e "${GREEN}[SUCCESS] SSL setup completed for $DOM!${NC}"
+            fi
+            press_any_key
+            ;;
+        4)
+            clear
+            echo -e "${CYAN}=== Realtime Panel Logs (Press Ctrl+C to exit) ===${NC}"
+            journalctl -u raretriccks-web -u ws-proxy -u autokill -u dropbear -n 50 -f
+            press_any_key
+            ;;
+        5)
+            clear
+            echo -e "${CYAN}=== System & Panel Information ===${NC}"
+            echo -e "Operating System : $(lsb_release -ds 2>/dev/null || cat /etc/issue)"
+            echo -e "Web Panel Port   : 2026"
+            echo -e "WebSocket Port   : 2082"
+            echo -e "Dropbear Ports   : 109, 447"
+            echo -e "Admin Config     : /etc/raretriccks/panel_config.json"
+            echo -e "User Configs Dir : /etc/raretriccks/users/"
+            press_any_key
+            ;;
+        6)
+            clear
+            echo -e "${RED}=== COMPLETELY UNINSTALL PANEL ===${NC}"
+            read -rp "Kya aap waqai Panel aur sabhi settings delete karna chahte hain? (y/n): " confirm
+            if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                systemctl stop raretriccks-web ws-proxy autokill nginx dropbear 2>/dev/null
+                systemctl disable raretriccks-web ws-proxy autokill 2>/dev/null
+                rm -f /etc/systemd/system/raretriccks-web.service /etc/systemd/system/ws-proxy.service /etc/systemd/system/autokill.service
+                rm -rf /etc/raretriccks /usr/local/bin/raretriccks_web.py /usr/local/bin/ws-proxy.py /usr/local/bin/autokill.py /usr/local/bin/menu /usr/bin/menu
+                systemctl daemon-reload
+                echo -e "${GREEN}[SUCCESS] RareTriccks Web Panel completely uninstalled!${NC}"
+                exit 0
+            else
+                echo -e "${YELLOW}Uninstall cancelled.${NC}"
+            fi
+            press_any_key
+            ;;
+        0)
+            exit 0
+            ;;
+        *)
+            echo "Invalid option"; sleep 1
+            ;;
+    esac
+done
+MENU_EOF
+
+chmod +x /usr/local/bin/menu
+cp /usr/local/bin/menu /usr/bin/menu 2>/dev/null
+chmod -R 777 /etc/raretriccks
+
+# 9. Deploy Systemd Services
+cat << 'SVC_WEB' > /etc/systemd/system/raretriccks-web.service
+[Unit]
+Description=RareTriccks Web Panel Dashboard
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/raretriccks_web.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVC_WEB
+
+cat << 'SVC_WS' > /etc/systemd/system/ws-proxy.service
+[Unit]
+Description=RareTriccks WebSocket Proxy Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVC_WS
+
+cat << 'SVC_AK' > /etc/systemd/system/autokill.service
+[Unit]
+Description=RareTriccks Auto-Kill & Bandwidth Tracking Daemon
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/autokill.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVC_AK
+
+# 10. Default Admin Credentials Config
+python3 -c "import json; f=open('/etc/raretriccks/panel_config.json','w'); json.dump({'admin_user':'admin','admin_pass':'AdminPassword123!'},f); f.close()"
+
+# 11. Enable & Restart All Services
+echo -e "${BLUE}[7/7] System Services Enable Aur Restart Ho Rahi Hain...${NC}"
+systemctl daemon-reload
+systemctl enable dropbear ssh nginx raretriccks-web ws-proxy autokill
+systemctl restart dropbear ssh nginx raretriccks-web ws-proxy autokill
+
+clear
+IP_ADDR=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+echo -e "${GREEN}====================================================${NC}"
+echo -e "${YELLOW}   ARTRICKS PANEL INSTALLATION COMPLETED!        ${NC}"
+echo -e "${GREEN}   OWNER: ALIRAZA | CHANNEL: ARTRICKS             ${NC}"
+echo -e "${GREEN}====================================================${NC}"
+echo -e " Web Dashboard : ${CYAN}http://${IP_ADDR}:2026${NC}"
+echo -e " Admin Username: ${CYAN}admin${NC}"
+echo -e " Admin Password: ${CYAN}AdminPassword123!${NC}"
+echo -e "${GREEN}----------------------------------------------------${NC}"
+echo -e " Terminal Menu : Type ${BOLD}${YELLOW}menu${NC} on terminal anytime"
+echo -e "${GREEN}====================================================${NC}"
+
+INSTALLER_EOF
+
+chmod +x /tmp/install_panel.sh
+/tmp/install_panel.sh
